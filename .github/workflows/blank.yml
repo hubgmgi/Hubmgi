@@ -196,9 +196,165 @@ jobs:
               }
               Expand-Archive $plugin.FullName -DestinationPath "$dir\Ghidra\Extensions" -Force
 
-              # install the JDK this Ghidra version requires
-              $jmin = 21   # fallback only — used when application.properties can't be read; Ghidra itself states the real floor, trust that value when present (25 is a real GA Temurin release too — see https://api.adoptium.net/v3/info/available_releases)
-              $propFile = Join-Path $dir "Ghidra\application.properties"
+              # pinned to 25 on purpose — not derived from Ghidra's application.properties floor.
+              # Ghidra only needs 21+; this installs Temurin 25 specifically regardless of that floor.
+              $jmin = 25
+              Write-Host "Installing JDK $jmin (pinned)"
+
+              # --- Primary: official Temurin MSI installer (matches https://adoptium.net/download) ---
+              $installDir = "C:\Tools\jdk\jdk-$jmin"
+              $jdk = if (Test-Path "$installDir\bin\java.exe") { $installDir } else { $null }
+              if (-not $jdk) {
+                  try {
+                      $assets = Invoke-RestMethod "https://api.adoptium.net/v3/assets/latest/$jmin/hotspot?image_type=jdk&os=windows&architecture=x64&vendor=eclipse"
+                      $release = $assets | Where-Object { $_.binary.installer } | Select-Object -First 1
+                      if (-not $release) { throw "No GA Windows x64 MSI installer published for feature version $jmin yet" }
+
+                      $msiUrl  = $release.binary.installer.link
+                      $msiHash = $release.binary.installer.checksum
+                      $msiPath = "$env:TEMP\temurin-jdk$jmin.msi"
+                      Write-Host "Fetching $msiUrl"
+                      Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+
+                      if ($msiHash) {
+                          $actualHash = (Get-FileHash $msiPath -Algorithm SHA256).Hash
+                          if ($actualHash -ne $msiHash.ToUpper()) { throw "SHA-256 mismatch: expected $msiHash, got $actualHash" }
+                          Write-Host "Checksum verified OK" -ForegroundColor Green
+                      }
+
+                      New-Item -ItemType Directory -Force $installDir | Out-Null
+                      $logPath = "$env:TEMP\jdk$jmin-install.log"
+                      # FeatureJavaHome is NOT part of the common INSTALLLEVEL=1 one-liner — must be named explicitly
+                      # or JAVA_HOME never gets set and every downstream step that relies on it silently breaks.
+                      $msiArgs = @(
+                          "/i", "`"$msiPath`"",
+                          "/quiet", "/norestart",
+                          "ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome",
+                          "INSTALLDIR=`"$installDir`"",
+                          "/l*v", "`"$logPath`""
+                      )
+                      $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+                      if ($proc.ExitCode -notin 0, 3010) {
+                          $tail = if (Test-Path $logPath) { (Get-Content $logPath -Tail 40) -join "`n" } else { "(no msi log found)" }
+                          throw "msiexec exited $($proc.ExitCode).`n--- tail of $logPath ---`n$tail"
+                      }
+                      Write-Host "MSI install exit code $($proc.ExitCode) (0=ok, 3010=ok-reboot-pending)" -ForegroundColor Green
+                  } catch { Write-Host "Temurin MSI install failed: $_" -ForegroundColor Yellow }
+                  $jdk = if (Test-Path "$installDir\bin\java.exe") { $installDir } else { $null }
+              }
+
+              # --- Fallback 1: raw zip archive from the same API family ---
+              if (-not $jdk) {
+                  try {
+                      $apiUrl = "https://api.adoptium.net/v3/binary/latest/$jmin/ga/windows/x64/jdk/hotspot/normal/eclipse"
+                      $probe = Invoke-WebRequest -Uri $apiUrl -MaximumRedirection 0 -ErrorAction SilentlyContinue -UseBasicParsing
+                      $fetchUrl = if ($probe -and $probe.Headers.Location) { $probe.Headers.Location } else { $apiUrl }
+                      $resp = Invoke-WebRequest -Uri $fetchUrl -OutFile "$env:TEMP\jdk.zip" -PassThru -UseBasicParsing
+                      if ($resp.StatusCode -ne 200 -or (Get-Item "$env:TEMP\jdk.zip").Length -lt 1MB) {
+                          throw "Adoptium returned status $($resp.StatusCode) or a truncated archive"
+                      }
+                      Expand-Archive "$env:TEMP\jdk.zip" -DestinationPath C:\Tools\jdk -Force
+                  } catch { Write-Host "Adoptium zip fallback failed: $_" -ForegroundColor Yellow }
+                  $jdk = (Get-ChildItem C:\Tools\jdk -Directory -Filter "jdk-$jmin*" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+              }
+
+              # --- Fallback 2: chocolatey ---
+              if (-not $jdk) {
+                  Write-Host "Falling back to choco for temurin$jmin..." -ForegroundColor Yellow
+                  choco install "temurin$jmin" -y --no-progress
+                  $jdk = (Get-ChildItem "C:\Program Files\Eclipse Adoptium" -Directory -Filter "jdk-$jmin*" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1).FullName
+              }
+              if (-not $jdk -or -not (Test-Path "$jdk\bin\java.exe")) {
+                  throw "Could not install JDK $jmin — Ghidra and the MCP bridge cannot proceed without it"
+              }
+
+              # proof of life — don't trust the directory exists, prove java actually runs
+              & "$jdk\bin\java.exe" -version
+              if ($LASTEXITCODE -ne 0) { throw "Installed JDK at $jdk failed to execute (-version exited $LASTEXITCODE)" }
+              Write-Host "Using JDK: $jdk" -ForegroundColor Green
+
+              [Environment]::SetEnvironmentVariable("JAVA_HOME", $jdk, "Machine")
+              $env:JAVA_HOME = $jdk   # make it usable in *this* process immediately, not just future shells
+              $env:Path = "$jdk\bin;$env:Path"
+
+              # make ghidraRun.bat itself always use this JDK (works no matter how Ghidra is opened)
+              $lp = Join-Path $dir "support\launch.properties"
+              $jdkFwd = $jdk -replace '\\','/'
+              $lines = @(Get-Content $lp)
+              if ($lines -match '^\s*#?\s*JAVA_HOME_OVERRIDE=') {
+                  $lines = $lines -replace '^\s*#?\s*JAVA_HOME_OVERRIDE=.*$', "JAVA_HOME_OVERRIDE=$jdkFwd"
+              } else {
+                  $lines += "JAVA_HOME_OVERRIDE=$jdkFwd"
+              }
+              Set-Content -Path $lp -Value $lines
+              Write-Host "launch.properties -> JAVA_HOME_OVERRIDE=$jdkFwd"
+
+              # launcher sets JAVA_HOME itself (this desktop session still has the runner's old Java 17)
+              $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Ghidra.lnk")
+              $s.TargetPath = "cmd.exe"
+              $s.Arguments = '/c set "JAVA_HOME=' + $jdk + '" && "' + $dir + '\ghidraRun.bat"'
+              $s.WorkingDirectory = $dir
+              $s.Save()
+              Write-Host "Ghidra OK" -ForegroundColor Green
+              $ghidraReady = $true
+          } catch { Write-Host "Ghidra step failed: $_" -ForegroundColor Red }
+
+          Write-Host "=== 3/4 MCP bridge + WorkBuddy config ===" -ForegroundColor Cyan
+          if (-not $ghidraReady) {
+              Write-Host "Skipping MCP bridge — Ghidra/JDK did not come up clean, nothing for it to bridge to." -ForegroundColor Yellow
+          } else {
+          try {
+              & C:\Python311\python.exe -m pip install --quiet mcp requests
+              $cfg = @{ mcpServers = @{ ghidra = @{
+                  command = "C:\Python311\python.exe"
+                  args    = @("C:\Tools\GhidraMCP\bridge_mcp_ghidra.py", "--ghidra-server", "http://127.0.0.1:8080/")
+              } } } | ConvertTo-Json -Depth 6
+              foreach ($home_ in @($env:USERPROFILE, "C:\Users\Default")) {
+                  New-Item -ItemType Directory -Force "$home_\.workbuddy" | Out-Null
+                  [IO.File]::WriteAllText("$home_\.workbuddy\mcp.json", $cfg, (New-Object Text.UTF8Encoding $false))
+              }
+              Write-Host "MCP config OK" -ForegroundColor Green
+          } catch { Write-Host "MCP step failed: $_" -ForegroundColor Red }
+          }
+
+          Write-Host "=== 4/4 WorkBuddy ===" -ForegroundColor Cyan
+          try {
+              $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                  Install-PackageProvider NuGet -Force | Out-Null
+                  Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
+                  Repair-WinGetPackageManager -AllUsers
+                  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              }
+              if (Get-Command winget -ErrorAction SilentlyContinue) {
+                  winget install --id Tencent.WorkBuddy --exact --silent --accept-package-agreements --accept-source-agreements
+              } else {
+                  Write-Host "winget not available - opening the WorkBuddy download page instead" -ForegroundColor Yellow
+                  Open-Url "https://www.workbuddy.ai/"
+              }
+          } catch {
+              Write-Host "WorkBuddy step failed: $_" -ForegroundColor Red
+              Open-Url "https://www.workbuddy.ai/"
+          }
+
+          try {
+              $wbDirs = Get-ChildItem "C:\Users\*\AppData\Local\Programs","C:\Program Files","C:\Program Files (x86)" -Directory -Filter "*WorkBuddy*" -ErrorAction SilentlyContinue
+              $wbExe = $wbDirs | ForEach-Object { Get-ChildItem $_.FullName -Filter "WorkBuddy*.exe" -ErrorAction SilentlyContinue } | Select-Object -First 1
+              if ($wbExe) {
+                  $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\WorkBuddy.lnk")
+                  $s.TargetPath = $wbExe.FullName
+                  $s.WorkingDirectory = $wbExe.DirectoryName
+                  $s.Save()
+                  Write-Host "WorkBuddy shortcut created" -ForegroundColor Green
+              }
+          } catch { Write-Host "WorkBuddy shortcut failed: $_" -ForegroundColor Red }
+
+          Write-Host ""
+          Write-Host "DONE. Open Ghidra from the desktop icon." -ForegroundColor Green
+          if (-not $Unattended) { Read-Host "Press Enter to close" }
+          '@
+
+          $script = $script.Replace('__TOKEN__', $env:GH_TOKoperties"
               if (Test-Path $propFile) {
                   $line = Get-Content $propFile | Where-Object { $_ -match '^application\.java\.min=' } | Select-Object -First 1
                   if ($line) {
