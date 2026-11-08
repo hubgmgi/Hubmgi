@@ -140,25 +140,27 @@ jobs:
           New-Item -ItemType Directory -Force C:\Tools | Out-Null
 
           $script = @'
+          param([switch]$Unattended)
           $ErrorActionPreference = "Continue"
           $ProgressPreference = "SilentlyContinue"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
           # self-elevate (no UAC prompt on this machine)
           $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          if (-not $isAdmin) {
+          if (-not $isAdmin -and -not $Unattended) {
               Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`""
               exit
           }
 
           $h = @{ "User-Agent" = "rdp-setup"; Authorization = "Bearer __TOKEN__" }
+          function Open-Url($u) { if (-not $Unattended) { Start-Process $u } }
           function Get-Json($url) {
               try { return Invoke-RestMethod $url -Headers $h }
               catch { return Invoke-RestMethod $url -Headers @{ "User-Agent" = "rdp-setup" } }
           }
 
-          Write-Host "=== 1/4 Java + Python ===" -ForegroundColor Cyan
-          choco install temurin21 python311 -y --no-progress
+          Write-Host "=== 1/4 Python ===" -ForegroundColor Cyan
+          choco install python311 -y --no-progress
 
           Write-Host "=== 2/4 Ghidra + GhidraMCP ===" -ForegroundColor Cyan
           try {
@@ -193,8 +195,27 @@ jobs:
               }
               Expand-Archive $plugin.FullName -DestinationPath "$dir\Ghidra\Extensions" -Force
 
+              # install the JDK this Ghidra version requires
+              $jmin = 25
+              $propFile = Join-Path $dir "Ghidra\application.properties"
+              if (Test-Path $propFile) {
+                  $line = Get-Content $propFile | Where-Object { $_ -match '^application\.java\.min=' } | Select-Object -First 1
+                  if ($line) { $jmin = [int](($line -split '=')[1].Trim()) }
+              }
+              Write-Host "Ghidra needs JDK $jmin+"
+              choco install "temurin$jmin" -y --no-progress
+              $jdk = (Get-ChildItem "C:\Program Files\Eclipse Adoptium" -Directory -Filter "jdk-$jmin*" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1).FullName
+              if (-not $jdk) {
+                  choco install temurin -y --no-progress
+                  $jdk = (Get-ChildItem "C:\Program Files\Eclipse Adoptium" -Directory -Filter "jdk-*" | Sort-Object Name -Descending | Select-Object -First 1).FullName
+              }
+              Write-Host "Using JDK: $jdk"
+              [Environment]::SetEnvironmentVariable("JAVA_HOME", $jdk, "Machine")
+
+              # launcher sets JAVA_HOME itself (this desktop session still has the runner's old Java 17)
               $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Ghidra.lnk")
-              $s.TargetPath = "$dir\ghidraRun.bat"
+              $s.TargetPath = "cmd.exe"
+              $s.Arguments = '/c set "JAVA_HOME=' + $jdk + '" && "' + $dir + '\ghidraRun.bat"'
               $s.WorkingDirectory = $dir
               $s.Save()
               Write-Host "Ghidra OK" -ForegroundColor Green
@@ -203,6 +224,111 @@ jobs:
           Write-Host "=== 3/4 MCP bridge + WorkBuddy config ===" -ForegroundColor Cyan
           try {
               & C:\Python311\python.exe -m pip install --quiet mcp requests
+              $cfg = @{ mcpServers = @{ ghidra = @{
+                  command = "C:\Python311\python.exe"
+                  args    = @("C:\Tools\GhidraMCP\bridge_mcp_ghidra.py", "--ghidra-server", "http://127.0.0.1:8080/")
+              } } } | ConvertTo-Json -Depth 6
+              foreach ($home_ in @($env:USERPROFILE, "C:\Users\Default")) {
+                  New-Item -ItemType Directory -Force "$home_\.workbuddy" | Out-Null
+                  [IO.File]::WriteAllText("$home_\.workbuddy\mcp.json", $cfg, (New-Object Text.UTF8Encoding $false))
+              }
+              Write-Host "MCP config OK" -ForegroundColor Green
+          } catch { Write-Host "MCP step failed: $_" -ForegroundColor Red }
+
+          Write-Host "=== 4/4 WorkBuddy ===" -ForegroundColor Cyan
+          try {
+              $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                  Install-PackageProvider NuGet -Force | Out-Null
+                  Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
+                  Repair-WinGetPackageManager -AllUsers
+                  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              }
+              if (Get-Command winget -ErrorAction SilentlyContinue) {
+                  winget install --id Tencent.WorkBuddy --exact --silent --accept-package-agreements --accept-source-agreements
+              } else {
+                  Write-Host "winget not available - opening the WorkBuddy download page instead" -ForegroundColor Yellow
+                  Open-Url "https://www.workbuddy.ai/"
+              }
+          } catch {
+              Write-Host "WorkBuddy step failed: $_" -ForegroundColor Red
+              Open-Url "https://www.workbuddy.ai/"
+          }
+
+          try {
+              $wbDirs = Get-ChildItem "C:\Users\*\AppData\Local\Programs","C:\Program Files","C:\Program Files (x86)" -Directory -Filter "*WorkBuddy*" -ErrorAction SilentlyContinue
+              $wbExe = $wbDirs | ForEach-Object { Get-ChildItem $_.FullName -Filter "WorkBuddy*.exe" -ErrorAction SilentlyContinue } | Select-Object -First 1
+              if ($wbExe) {
+                  $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\WorkBuddy.lnk")
+                  $s.TargetPath = $wbExe.FullName
+                  $s.WorkingDirectory = $wbExe.DirectoryName
+                  $s.Save()
+                  Write-Host "WorkBuddy shortcut created" -ForegroundColor Green
+              }
+          } catch { Write-Host "WorkBuddy shortcut failed: $_" -ForegroundColor Red }
+
+          Write-Host ""
+          Write-Host "DONE. Open Ghidra from the desktop icon." -ForegroundColor Green
+          if (-not $Unattended) { Read-Host "Press Enter to close" }
+          '@
+
+          $script = $script.Replace('__TOKEN__', $env:GH_TOKEN)
+          Set-Content -Path C:\Tools\Install-Tools.ps1 -Value $script -Encoding UTF8
+
+          # desktop icon + auto-run at login
+          $ws = New-Object -ComObject WScript.Shell
+          foreach ($path in @("C:\Users\Public\Desktop\Install Tools.lnk")) {
+              $lnk = $ws.CreateShortcut($path)
+              $lnk.TargetPath = "powershell.exe"
+              $lnk.Arguments = "-NoExit -ExecutionPolicy Bypass -File C:\Tools\Install-Tools.ps1"
+              $lnk.IconLocation = "powershell.exe,0"
+              $lnk.Save()
+          }
+
+      - name: Run Tools Installer (unattended)
+        continue-on-error: true   # RDP still comes up even if an install fails
+        timeout-minutes: 25
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Tools\Install-Tools.ps1 -Unattended
+
+      - name: Maintain Connection + Auto Re-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RDP_ENABLED: ${{ vars.RDP_ENABLED }}   # set repo variable to "false" to stop the chain
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Host: gh-rdp  (or $env:TAILSCALE_IP)"
+          Write-Host "User: RDP"
+          Write-Host "Pass: your RDP_PASSWORD secret"
+          Write-Host "==================`n"
+
+          $end        = (Get-Date).AddMinutes(325)
+          $dispatchAt = (Get-Date).AddMinutes(315)
+          $dispatched = $false
+
+          while ((Get-Date) -lt $end) {
+              if (-not $dispatched -and (Get-Date) -ge $dispatchAt) {
+                  if ($env:RDP_ENABLED -ne 'false') {
+                      Write-Host "[$(Get-Date)] Dispatching next run..."
+                      gh workflow run RDP --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME
+                  } else {
+                      Write-Host "RDP_ENABLED=false, chain stopped."
+                  }
+                  $dispatched = $true
+              }
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 30
+          }
+
+          # free the hostname so the next run gets "gh-rdp" again
+          & $env:TS_BIN logout
+
+      - name: Tailscale logout (also runs if you cancel the job)
+        if: always()
+        run: |
+          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+          if (-not $ts) { $ts = "$env:ProgramFiles\Tailscale\tailscale.exe" }
+          & $ts logout
+cp requests
               $cfg = @{ mcpServers = @{ ghidra = @{
                   command = "C:\Python311\python.exe"
                   args    = @("C:\Tools\GhidraMCP\bridge_mcp_ghidra.py", "--ghidra-server", "http://127.0.0.1:8080/")
