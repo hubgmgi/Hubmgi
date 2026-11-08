@@ -51,6 +51,23 @@ jobs:
               exit 1
           }
 
+      - name: Remove stale gh-rdp nodes
+        continue-on-error: true
+        env:
+          TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          $tok = (Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/oauth/token" `
+              -Body @{ client_id = $env:TS_ID; client_secret = $env:TS_SECRET; grant_type = "client_credentials" }).access_token
+          $h = @{ Authorization = "Bearer $tok" }
+          $devs = (Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices" -Headers $h).devices
+          foreach ($d in $devs) {
+              if ($d.name -like "gh-rdp*") {
+                  Write-Host "Deleting stale node: $($d.name)"
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $h | Out-Null
+              }
+          }
+
       - name: Connect Tailscale (OAuth)
         uses: tailscale/github-action@v3
         with:
@@ -198,6 +215,83 @@ jobs:
           Write-Host "=== 4/4 WorkBuddy ===" -ForegroundColor Cyan
           try {
               $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                  Install-PackageProvider NuGet -Force | Out-Null
+                  Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
+                  Repair-WinGetPackageManager -AllUsers
+                  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Microsoft\WindowsApps"
+              }
+              if (Get-Command winget -ErrorAction SilentlyContinue) {
+                  winget install --id Tencent.WorkBuddy --exact --silent --accept-package-agreements --accept-source-agreements
+              } else {
+                  Write-Host "winget not available - opening the WorkBuddy download page instead" -ForegroundColor Yellow
+                  Start-Process "https://www.workbuddy.ai/"
+              }
+          } catch {
+              Write-Host "WorkBuddy step failed: $_" -ForegroundColor Red
+              Start-Process "https://www.workbuddy.ai/"
+          }
+
+          Write-Host ""
+          Write-Host "DONE. Open Ghidra from the desktop icon." -ForegroundColor Green
+          Read-Host "Press Enter to close"
+          '@
+
+          $script = $script.Replace('__TOKEN__', $env:GH_TOKEN)
+          Set-Content -Path C:\Tools\Install-Tools.ps1 -Value $script -Encoding UTF8
+
+          # desktop icon + auto-run at login
+          $ws = New-Object -ComObject WScript.Shell
+          foreach ($path in @(
+              "C:\Users\Public\Desktop\Install Tools.lnk",
+              "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\Install Tools.lnk"
+          )) {
+              $lnk = $ws.CreateShortcut($path)
+              $lnk.TargetPath = "powershell.exe"
+              $lnk.Arguments = "-NoExit -ExecutionPolicy Bypass -File C:\Tools\Install-Tools.ps1"
+              $lnk.IconLocation = "powershell.exe,0"
+              $lnk.Save()
+          }
+
+      - name: Maintain Connection + Auto Re-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RDP_ENABLED: ${{ vars.RDP_ENABLED }}   # set repo variable to "false" to stop the chain
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Host: gh-rdp  (or $env:TAILSCALE_IP)"
+          Write-Host "User: RDP"
+          Write-Host "Pass: your RDP_PASSWORD secret"
+          Write-Host "==================`n"
+
+          $end        = (Get-Date).AddMinutes(340)
+          $dispatchAt = (Get-Date).AddMinutes(330)
+          $dispatched = $false
+
+          while ((Get-Date) -lt $end) {
+              if (-not $dispatched -and (Get-Date) -ge $dispatchAt) {
+                  if ($env:RDP_ENABLED -ne 'false') {
+                      Write-Host "[$(Get-Date)] Dispatching next run..."
+                      gh workflow run RDP --repo $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME
+                  } else {
+                      Write-Host "RDP_ENABLED=false, chain stopped."
+                  }
+                  $dispatched = $true
+              }
+              Write-Host "[$(Get-Date)] RDP Active"
+              Start-Sleep -Seconds 30
+          }
+
+          # free the hostname so the next run gets "gh-rdp" again
+          & $env:TS_BIN logout
+
+      - name: Tailscale logout (also runs if you cancel the job)
+        if: always()
+        run: |
+          $ts = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+          if (-not $ts) { $ts = "$env:ProgramFiles\Tailscale\tailscale.exe" }
+          & $ts logout
+Apps"
               if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
                   Install-PackageProvider NuGet -Force | Out-Null
                   Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
