@@ -85,6 +85,96 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+      - name: Install Ghidra + GhidraMCP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; "User-Agent" = "gh-actions" }
+          choco install temurin21 python311 -y --no-progress
+
+          # --- GhidraMCP plugin + bridge ---
+          $mcp = Invoke-RestMethod https://api.github.com/repos/LaurieWired/GhidraMCP/releases/latest -Headers $h
+          $asset = $mcp.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+          Invoke-WebRequest $asset.browser_download_url -OutFile "$env:TEMP\mcp.zip"
+          Expand-Archive "$env:TEMP\mcp.zip" -DestinationPath "$env:TEMP\mcp" -Force
+
+          $plugin = Get-ChildItem "$env:TEMP\mcp" -Recurse -Filter "GhidraMCP*.zip" | Select-Object -First 1
+          if (-not $plugin) { $plugin = Get-Item "$env:TEMP\mcp.zip" }
+          $bridge = Get-ChildItem "$env:TEMP\mcp" -Recurse -Filter "bridge_mcp_ghidra.py" | Select-Object -First 1
+
+          New-Item -ItemType Directory -Force C:\Tools\GhidraMCP | Out-Null
+          if ($bridge) { Copy-Item $bridge.FullName C:\Tools\GhidraMCP\ }
+          else { Invoke-WebRequest https://raw.githubusercontent.com/LaurieWired/GhidraMCP/main/bridge_mcp_ghidra.py -OutFile C:\Tools\GhidraMCP\bridge_mcp_ghidra.py }
+
+          # --- match Ghidra version to what the plugin was built for ---
+          Expand-Archive $plugin.FullName -DestinationPath "$env:TEMP\plug" -Force
+          $props = Get-ChildItem "$env:TEMP\plug" -Recurse -Filter "extension.properties" | Select-Object -First 1
+          $ver = $null
+          if ($props) { $ver = (Select-String -Path $props.FullName -Pattern '^version=(.+)$').Matches[0].Groups[1].Value.Trim() }
+          Write-Host "Plugin targets Ghidra: $ver"
+
+          try { $g = Invoke-RestMethod "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_${ver}_build" -Headers $h }
+          catch { $g = Invoke-RestMethod https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest -Headers $h }
+          $ga = $g.assets | Where-Object { $_.name -like "ghidra_*_PUBLIC_*.zip" } | Select-Object -First 1
+          Invoke-WebRequest $ga.browser_download_url -OutFile "$env:TEMP\ghidra.zip"
+          Expand-Archive "$env:TEMP\ghidra.zip" -DestinationPath "C:\Tools" -Force
+
+          $dir = (Get-ChildItem C:\Tools -Directory -Filter "ghidra_*" | Select-Object -First 1).FullName
+          Expand-Archive $plugin.FullName -DestinationPath "$dir\Ghidra\Extensions" -Force
+
+          # --- Python deps for the MCP bridge ---
+          & C:\Python311\python.exe -m pip install --quiet mcp requests
+
+          # --- WorkBuddy MCP config (copied into the RDP user's profile at first login) ---
+          $cfg = @{ mcpServers = @{ ghidra = @{
+              command = "C:\Python311\python.exe"
+              args    = @("C:\Tools\GhidraMCP\bridge_mcp_ghidra.py", "--ghidra-server", "http://127.0.0.1:8080/")
+          } } } | ConvertTo-Json -Depth 6
+          New-Item -ItemType Directory -Force "C:\Users\Default\.workbuddy" | Out-Null
+          [IO.File]::WriteAllText("C:\Users\Default\.workbuddy\mcp.json", $cfg, (New-Object Text.UTF8Encoding $false))
+
+          # --- desktop shortcut ---
+          $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\Ghidra.lnk")
+          $s.TargetPath = "$dir\ghidraRun.bat"
+          $s.WorkingDirectory = $dir
+          $s.Save()
+
+      - name: Install WorkBuddy
+        continue-on-error: true   # RDP still works if this fails
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+              Install-PackageProvider NuGet -Force | Out-Null
+              Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery | Out-Null
+              Repair-WinGetPackageManager -AllUsers
+          }
+          winget install --id Tencent.WorkBuddy --exact --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Install IDA Pro (optional, needs secrets)
+        env:
+          IDA_URL: ${{ secrets.IDA_URL }}
+          IDA_INSTALL_PASSWORD: ${{ secrets.IDA_INSTALL_PASSWORD }}
+          IDA_LICENSE: ${{ secrets.IDA_LICENSE }}
+        run: |
+          if (-not $env:IDA_URL) { Write-Host "IDA_URL not set, skipping IDA"; exit 0 }
+
+          Invoke-WebRequest $env:IDA_URL -OutFile "$env:TEMP\ida-installer.exe"
+
+          $args = @("--mode","unattended","--prefix","C:\IDA")
+          if ($env:IDA_INSTALL_PASSWORD) { $args += @("--installpassword",$env:IDA_INSTALL_PASSWORD) }
+          Start-Process "$env:TEMP\ida-installer.exe" -ArgumentList $args -Wait
+
+          $exe = Get-ChildItem C:\IDA -Recurse -Filter ida.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { Write-Error "ida.exe not found after install"; exit 1 }
+
+          if ($env:IDA_LICENSE) {
+              [IO.File]::WriteAllText((Join-Path $exe.DirectoryName "idapro.hexlic"), $env:IDA_LICENSE, (New-Object Text.UTF8Encoding $false))
+          }
+
+          $s = (New-Object -ComObject WScript.Shell).CreateShortcut("C:\Users\Public\Desktop\IDA Pro.lnk")
+          $s.TargetPath = $exe.FullName
+          $s.WorkingDirectory = $exe.DirectoryName
+          $s.Save()
+
       - name: Maintain Connection + Auto Re-run
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,8 +186,8 @@ jobs:
           Write-Host "Pass: your RDP_PASSWORD secret"
           Write-Host "==================`n"
 
-          $end        = (Get-Date).AddMinutes(340)
-          $dispatchAt = (Get-Date).AddMinutes(330)
+          $end        = (Get-Date).AddMinutes(330)
+          $dispatchAt = (Get-Date).AddMinutes(320)
           $dispatched = $false
 
           while ((Get-Date) -lt $end) {
