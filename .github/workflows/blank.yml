@@ -155,6 +155,20 @@ jobs:
               exit
           }
 
+          # Only one install run at a time. Without this, the unattended CI-triggered run and a
+          # Startup-folder relaunch from an RDP login can overlap and both start unzipping/msiexec/
+          # choco/winget at once, fighting over the same 2 vCPU / 7GB a hosted runner actually has -
+          # a very plausible way to starve the runner agent itself and trip "lost communication with
+          # the server." Global\ makes the mutex visible across sessions (CI step vs RDP login), which
+          # requires admin - fine here since we're always past the self-elevate check by this point.
+          $mutex = New-Object System.Threading.Mutex($false, "Global\InstallToolsRDP")
+          if (-not $mutex.WaitOne(0)) {
+              Write-Host "Another Install-Tools run is already in progress - exiting instead of piling on." -ForegroundColor Yellow
+              exit 0
+          }
+
+          try {
+
           $h = @{ "User-Agent" = "rdp-setup"; Authorization = "Bearer __TOKEN__" }
           function Open-Url($u) { if (-not $Unattended) { Start-Process $u } }
           function Get-Json($url) {
@@ -354,6 +368,11 @@ jobs:
 
           Write-Host ""
           Write-Host "DONE. Open Ghidra from the desktop icon." -ForegroundColor Green
+
+          } finally {
+              $mutex.ReleaseMutex()
+          }
+
           if (-not $Unattended) { Read-Host "Press Enter to close" }
           '@
 
